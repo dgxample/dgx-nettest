@@ -1,0 +1,257 @@
+#!/bin/bash
+# docker-lockdown — outbound iptables lockdown for Docker containers
+#
+# Designed to run via sudoers (no password prompt). Install to /usr/local/bin/
+# (root-owned) so sudo can find it and the user cannot modify it. e.g.:
+#   sudo cp docker-lockdown /usr/local/bin/
+#   sudo chown root:root /usr/local/bin/docker-lockdown
+#   sudo chmod 755 /usr/local/bin/docker-lockdown
+# Sudoers entry (optional — for passwordless/automated use):
+#   <user> ALL=(ALL) NOPASSWD: /usr/local/bin/docker-lockdown
+#
+# Port range: read from /etc/docker-lockdown.conf (written by ./setup on first
+# install). Override per-call with --port-min/--port-max flags if needed.
+# Config format:
+#   LOCKDOWN_PORT_MIN=1024
+#   LOCKDOWN_PORT_MAX=49151
+
+set -euo pipefail
+
+_DL_CONF="/etc/docker-lockdown.conf"
+if [[ -f "$_DL_CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$_DL_CONF"
+fi
+LOCKDOWN_PORT_MIN="${LOCKDOWN_PORT_MIN:-1024}"
+LOCKDOWN_PORT_MAX="${LOCKDOWN_PORT_MAX:-49151}"
+COMMENT_PREFIX="lockdown"
+CHAIN="DOCKER-USER"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+die()  { echo "docker-lockdown: $*" >&2; exit 1; }
+info() { echo "docker-lockdown: $*"; }
+
+[[ $EUID -eq 0 ]] || die "must run as root — use: sudo docker-lockdown ..."
+
+check_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "port must be a number: '$port'"
+  (( port >= LOCKDOWN_PORT_MIN && port <= LOCKDOWN_PORT_MAX )) \
+    || die "port $port is outside allowed range ${LOCKDOWN_PORT_MIN}-${LOCKDOWN_PORT_MAX} (override with --port-min / --port-max, or LOCKDOWN_PORT_MIN / LOCKDOWN_PORT_MAX env vars)"
+}
+
+# Extract "name:port" entries from lockdown comments in the chain
+lockdown_entries() {
+  # grep returns exit code 1 when no rules match; that is expected, not an error.
+  iptables -S "$CHAIN" 2>/dev/null \
+    | grep "comment \"${COMMENT_PREFIX}:" \
+    | grep -o "comment \"${COMMENT_PREFIX}:[^\"]*\"" \
+    | sed "s/comment \"${COMMENT_PREFIX}://; s/\"$//" \
+    | sort -u || true
+}
+
+# Extract just container names (strips :port suffix)
+lockdown_names() {
+  lockdown_entries | sed 's/:[0-9]*$//'
+}
+
+# Remove all lockdown rules for a container name; echoes count removed
+# Matches both new format (lockdown:name:port) and old format (lockdown:name)
+remove_rules_for() {
+  local name="$1"
+  local removed=0
+  while IFS= read -r rule; do
+    # Strip double quotes before splitting: iptables -S wraps --comment values in
+    # quotes, but lockdown comment values never contain spaces so this is safe.
+    rule="${rule//\"/}"
+    read -ra rule_args <<< "$rule"
+    iptables "${rule_args[@]}" 2>/dev/null && ((removed++)) || true
+  done < <(
+    iptables -S "$CHAIN" 2>/dev/null \
+      | grep "comment \"${COMMENT_PREFIX}:${name}[:\"]" \
+      | sed 's/^-A /-D /'
+  )
+  echo "$removed"
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+cmd_apply() {
+  local container="" port="" port_min="" port_max=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port-min)
+        [[ $# -ge 2 ]] || die "apply: --port-min requires a value"
+        port_min="$2"; shift 2 ;;
+      --port-max)
+        [[ $# -ge 2 ]] || die "apply: --port-max requires a value"
+        port_max="$2"; shift 2 ;;
+      -*)
+        die "apply: unknown option: $1" ;;
+      *)
+        if [[ -z "$container" ]]; then container="$1"
+        elif [[ -z "$port" ]]; then port="$1"
+        else die "apply: unexpected argument: $1"
+        fi
+        shift ;;
+    esac
+  done
+
+  [[ -n "$container" && -n "$port" ]] \
+    || die "apply: usage: apply <container_name> <host_port> [--port-min N] [--port-max N]"
+
+  [[ -n "$port_min" ]] && LOCKDOWN_PORT_MIN="$port_min"
+  [[ -n "$port_max" ]] && LOCKDOWN_PORT_MAX="$port_max"
+
+  check_port "$port"
+
+  # NetworkSettings.Networks is empty for created-but-not-started containers
+  # (e.g. after `docker compose up --no-start`). Fall back to the compose
+  # project network, which exists because compose creates networks before starting.
+  local network_id
+  network_id=$(docker inspect "$container" \
+    --format '{{range $net, $config := .NetworkSettings.Networks}}{{$config.NetworkID}} {{end}}' 2>/dev/null \
+    | awk '{print $1}')
+
+  if [[ -z "$network_id" ]]; then
+    local project
+    project=$(docker inspect "$container" \
+      --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)
+    if [[ -n "$project" ]]; then
+      network_id=$(docker network ls \
+        --filter "label=com.docker.compose.project=${project}" \
+        --format '{{.ID}}' 2>/dev/null | head -1)
+    fi
+  fi
+
+  [[ -n "$network_id" ]] \
+    || die "apply: could not get network ID for $container — is the container created?"
+
+  local subnet
+  subnet=$(docker network inspect "$network_id" \
+    --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null)
+  [[ -n "$subnet" ]] || die "apply: could not determine subnet for network $network_id"
+
+  local n
+  n=$(remove_rules_for "$container")
+  [[ $n -gt 0 ]] && info "replaced $n existing rule(s) for $container"
+
+  local comment="${COMMENT_PREFIX}:${container}:${port}"
+  iptables -I "$CHAIN" \
+    -s "$subnet" \
+    -m conntrack --ctstate ESTABLISHED,RELATED \
+    -j RETURN \
+    -m comment --comment "$comment"
+  iptables -A "$CHAIN" \
+    -s "$subnet" \
+    -j DROP \
+    -m comment --comment "$comment"
+
+  info "lockdown applied for $container (subnet $subnet, port $port)."
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || die "remove: usage: remove <container_name>"
+  local container="$1"
+  local n
+  n=$(remove_rules_for "$container")
+  if [[ $n -gt 0 ]]; then
+    info "removed $n rule(s) for $container."
+  else
+    info "no lockdown rules found for $container."
+  fi
+}
+
+cmd_cleanup() {
+  local names
+  names=$(lockdown_names)
+
+  if [[ -z "$names" ]]; then
+    info "no lockdown rules found."
+    return 0
+  fi
+
+  local removed_total=0
+  while IFS= read -r name; do
+    local running
+    running=$(docker inspect "$name" --format '{{.State.Running}}' 2>/dev/null || echo "false")
+    if [[ "$running" == "true" ]]; then
+      info "keeping rules for $name (running)"
+    else
+      local n
+      n=$(remove_rules_for "$name")
+      info "removed $n orphaned rule(s) for $name (not running)"
+      ((removed_total += n)) || true
+    fi
+  done <<< "$names"
+
+  ((removed_total > 0)) || info "no orphaned rules to remove."
+}
+
+cmd_status() {
+  local entries
+  entries=$(lockdown_entries)
+
+  if [[ -z "$entries" ]]; then
+    info "no lockdown rules active."
+    return 0
+  fi
+
+  while IFS= read -r entry; do
+    local name port running
+    if [[ "$entry" == *:* ]]; then
+      name="${entry%:*}"
+      port="${entry##*:}"
+    else
+      name="$entry"
+      port="(unknown)"
+    fi
+    running=$(docker inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "unknown")
+    printf "  %s  [%s]  port %s\n" "$name" "$running" "$port"
+    iptables -S "$CHAIN" 2>/dev/null \
+      | grep "comment \"${COMMENT_PREFIX}:${name}[:\"]" \
+      | sed 's/^-A DOCKER-USER //' \
+      | while IFS= read -r rule; do printf "    %s\n" "$rule"; done
+  done <<< "$entries"
+}
+
+usage() {
+  cat <<EOF
+Usage: sudo $(basename "$0") <command> [args]
+
+Commands:
+  apply <container_name> <host_port> [--port-min N] [--port-max N]
+      Apply outbound lockdown rules for a container. The container must already
+      exist (created or running). Port must be in range
+      ${LOCKDOWN_PORT_MIN}-${LOCKDOWN_PORT_MAX} (from /etc/docker-lockdown.conf,
+      or override with --port-min / --port-max flags).
+      Re-applying replaces existing rules.
+
+  remove <container_name>
+      Remove all lockdown iptables rules for the given container.
+
+  cleanup
+      Remove lockdown rules for containers that are not currently running.
+
+  status
+      Show all active lockdown rules with container state, port, and the
+      exact iptables rules in place.
+
+Note: the sudoers entry must use the full absolute path to this script:
+  <user> ALL=(ALL) NOPASSWD: /full/path/to/docker-lockdown
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+[[ $# -ge 1 ]] || { usage; exit 1; }
+case "$1" in
+  apply)          shift; cmd_apply   "$@" ;;
+  remove)         shift; cmd_remove  "$@" ;;
+  cleanup)               cmd_cleanup      ;;
+  status)                cmd_status       ;;
+  -h|--help|help)        usage            ;;
+  *) die "unknown command: $1 — run 'sudo docker-lockdown --help' for usage" ;;
+esac

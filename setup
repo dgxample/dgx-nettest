@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_DL_CONF="/etc/docker-lockdown.conf"
+
+read_lockdown_config() {
+    if [ -f "$_DL_CONF" ]; then
+        LOCKDOWN_PORT_MIN=$(grep '^LOCKDOWN_PORT_MIN=' "$_DL_CONF" | cut -d= -f2-)
+        LOCKDOWN_PORT_MAX=$(grep '^LOCKDOWN_PORT_MAX=' "$_DL_CONF" | cut -d= -f2-)
+    fi
+    LOCKDOWN_PORT_MIN="${LOCKDOWN_PORT_MIN:-1024}"
+    LOCKDOWN_PORT_MAX="${LOCKDOWN_PORT_MAX:-49151}"
+}
+
+write_lockdown_config() {
+    printf 'LOCKDOWN_PORT_MIN=%s\nLOCKDOWN_PORT_MAX=%s\n' \
+        "$LOCKDOWN_PORT_MIN" "$LOCKDOWN_PORT_MAX" \
+        | sudo tee "$_DL_CONF" > /dev/null
+    sudo chown root:root "$_DL_CONF"
+    sudo chmod 644 "$_DL_CONF"
+    echo "Port range ${LOCKDOWN_PORT_MIN}–${LOCKDOWN_PORT_MAX} written to ${_DL_CONF}."
+}
+
+ask_port_range() {
+    echo ""
+    echo "docker-lockdown validates the port against a range before touching iptables."
+    echo "This limits blast radius: a compromised tool cannot apply lockdown rules to"
+    echo "ports outside this range. Defaults (1024–49151) exclude privileged ports"
+    echo "(below 1024) and ephemeral ports (49152+)."
+    read -rp "Allowed port range min [${LOCKDOWN_PORT_MIN}]: " _input
+    LOCKDOWN_PORT_MIN="${_input:-$LOCKDOWN_PORT_MIN}"
+    read -rp "Allowed port range max [${LOCKDOWN_PORT_MAX}]: " _input
+    LOCKDOWN_PORT_MAX="${_input:-$LOCKDOWN_PORT_MAX}"
+    write_lockdown_config
+}
+
+show_port_range() {
+    echo "Port range: ${LOCKDOWN_PORT_MIN}–${LOCKDOWN_PORT_MAX} (from ${_DL_CONF})."
+}
+
+# Generate a self-signed cert into $1 (dir); $2 = default validity days.
+# Prompts for hostnames/IP/validity, writes cert.pem + key.pem (key chmod 600).
+gen_cert() {
+    local _dir="$1" _days_default="$2"
+    if ! command -v openssl &>/dev/null; then
+        echo "openssl not found. Install it: sudo apt-get install -y openssl"
+        exit 1
+    fi
+    local _host _ip
+    _host="$(hostname -f 2>/dev/null || hostname)"
+    _ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo ""
+    echo "The certificate lists every name/IP you reach this host by — browsers reject"
+    echo "it if the address in the URL is not listed. localhost and 127.0.0.1 are always"
+    echo "included."
+    read -rp "Hostname(s), space-separated [${_host}]: " _in
+    local _hosts="${_in:-$_host}"
+    read -rp "IP address [${_ip}]: " _in
+    local _certip="${_in:-$_ip}"
+    read -rp "Validity in days [${_days_default}]: " _in
+    local _days="${_in:-$_days_default}"
+    local _sans="DNS:localhost" _h
+    for _h in $_hosts; do _sans="DNS:${_h},${_sans}"; done
+    local _cn; _cn="$(echo "$_hosts" | awk '{print $1}')"
+    mkdir -p "$_dir"
+    chmod 700 "$_dir"
+    openssl req -x509 -newkey rsa:4096 -nodes \
+        -out "${_dir}/cert.pem" -keyout "${_dir}/key.pem" \
+        -days "$_days" -subj "/CN=${_cn}" \
+        -addext "subjectAltName=${_sans},IP:127.0.0.1,IP:${_certip}" 2>/dev/null
+    chmod 600 "${_dir}/key.pem"
+    echo "Certificate generated at ${_dir} (valid ${_days} days)."
+}
+
+# Print OS-trust-store instructions and the cert text for the user to install locally.
+show_trust_instructions() {
+    local _cert="$1"
+    echo ""
+    echo "=== Trust this certificate on the machine running your browser ==="
+    echo "A browser 'proceed anyway' exception only covers page navigation. To make"
+    echo "downloads and system tools trust it too, add it to your OS trust store:"
+    echo ""
+    echo "  Ubuntu/Debian:"
+    echo "    sudo cp server.crt /usr/local/share/ca-certificates/server.crt"
+    echo "    sudo update-ca-certificates"
+    echo "  macOS:"
+    echo "    sudo security add-trusted-cert -d -r trustRoot \\"
+    echo "      -k /Library/Keychains/System.keychain server.crt"
+    echo ""
+    echo "Save the certificate below as server.crt, run the commands, restart the browser."
+    echo "--- certificate ---"
+    cat "$_cert"
+    echo "--- end certificate ---"
+}
+
+ENV_FILE="$SCRIPT_DIR/.env"
+
+# Defaults before .env is loaded
+CONTAINER_UID="$(id -u)"
+HOST_PORT=""
+SECURITY_LEVEL="strict"
+DOCKER_LOCKDOWN_PATH="/usr/local/bin/docker-lockdown"
+LOCKDOWN_PORT_MIN="1024"
+LOCKDOWN_PORT_MAX="49151"
+USE_HTTPS="false"
+HOST_CERT_DIR=""
+CPU_LIMIT="1.00"
+MEM_LIMIT="256m"
+PIDS_LIMIT="50"
+TMP_SIZE="64m"
+RUN_SIZE="16m"
+RESTART_POLICY="${RESTART_POLICY:-no}"
+
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+fi
+
+echo "=== dgxample/dgx-nettest Setup ==="
+echo ""
+
+CURRENT_USER="$(whoami)"
+CURRENT_UID="$(id -u)"
+echo "Current user: ${CURRENT_USER} (UID ${CURRENT_UID})"
+echo "Container processes run as this UID. If volumes are mounted for data exchange,"
+echo "files will be owned by this UID on the host. Use your own UID to avoid"
+echo "permission mismatches."
+DEFAULT_UID="${CONTAINER_UID:-${CURRENT_UID}}"
+read -rp "Container UID [${DEFAULT_UID}]: " INPUT_UID
+CONTAINER_UID="${INPUT_UID:-$DEFAULT_UID}"
+
+echo ""
+echo "Host port — the port this container's API will be accessible on from the host."
+echo "Use a port in the 1024–49151 range: avoid privileged ports (below 1024, which"
+echo "require root to bind) and ephemeral ports (49152+, assigned dynamically by"
+echo "the OS for outgoing connections)."
+DEFAULT_PORT="${HOST_PORT:-8999}"
+read -rp "Host port [${DEFAULT_PORT}]: " INPUT_PORT
+HOST_PORT="${INPUT_PORT:-$DEFAULT_PORT}"
+
+# --- Lockdown setup ---
+echo ""
+echo "=== Network Lockdown ==="
+echo "Strict mode blocks all container-initiated outbound connections via iptables."
+echo "docker-lockdown manages the rules in Docker's DOCKER-USER chain and is"
+echo "installed root-owned so a sudoers entry for it is safe."
+echo ""
+
+DEFAULT_DL_INSTALL="${DOCKER_LOCKDOWN_PATH:-/usr/local/bin/docker-lockdown}"
+DL_SUDO_OK=false
+sudo -n "$DEFAULT_DL_INSTALL" --help &>/dev/null 2>&1 && DL_SUDO_OK=true
+
+CURRENT_SECURITY="${SECURITY_LEVEL:-strict}"
+
+# If both the installed binary and the repo copy exist, check for divergence
+if [ -f "$DEFAULT_DL_INSTALL" ] && [ -f "$SCRIPT_DIR/docker-lockdown" ]; then
+    if ! diff -q "$SCRIPT_DIR/docker-lockdown" "$DEFAULT_DL_INSTALL" &>/dev/null; then
+        echo "docker-lockdown at $DEFAULT_DL_INSTALL differs from this repo's copy."
+        echo "  1) Use repo copy   — overwrite installed version (sudo cp)"
+        echo "  2) Use installed   — overwrite repo copy"
+        echo "  3) Keep both as-is"
+        read -rp "Choice [1]: " _dl_choice
+        case "${_dl_choice:-1}" in
+            1)
+                sudo cp "$SCRIPT_DIR/docker-lockdown" "$DEFAULT_DL_INSTALL"
+                sudo chown root:root "$DEFAULT_DL_INSTALL"
+                sudo chmod 755 "$DEFAULT_DL_INSTALL"
+                echo "Updated $DEFAULT_DL_INSTALL from repo copy."
+                ;;
+            2)
+                cp "$DEFAULT_DL_INSTALL" "$SCRIPT_DIR/docker-lockdown"
+                echo "Updated repo copy from $DEFAULT_DL_INSTALL."
+                ;;
+            *)
+                echo "Keeping both as-is."
+                ;;
+        esac
+    fi
+fi
+
+if [ -f "$DEFAULT_DL_INSTALL" ] && $DL_SUDO_OK && [ "$CURRENT_SECURITY" = "strict" ]; then
+    echo "docker-lockdown is installed at $DEFAULT_DL_INSTALL (root-owned)."
+    echo "Passwordless sudo is configured. This allows automated tools such as"
+    echo "a web dashboard or management script to apply/remove iptables lockdown"
+    echo "rules when starting/stopping this container — without a password prompt."
+    echo "Strict mode also works without passwordless sudo; './start-container'"
+    echo "will prompt for your password instead."
+    SECURITY_LEVEL="strict"
+    DOCKER_LOCKDOWN_PATH="$DEFAULT_DL_INSTALL"
+
+    read_lockdown_config
+    if [ -f "$_DL_CONF" ]; then
+        show_port_range
+    else
+        ask_port_range
+    fi
+else
+    DEFAULT_LOCKDOWN="Y"
+    [ "$CURRENT_SECURITY" = "open" ] && DEFAULT_LOCKDOWN="N"
+    read -rp "Enable outbound lockdown? [${DEFAULT_LOCKDOWN}]: " INPUT_LOCKDOWN
+    INPUT_LOCKDOWN="${INPUT_LOCKDOWN:-$DEFAULT_LOCKDOWN}"
+
+    if [[ "$INPUT_LOCKDOWN" =~ ^[Yy]$ ]]; then
+        SECURITY_LEVEL="strict"
+
+        read_lockdown_config
+        ask_port_range
+
+        echo ""
+        echo "docker-lockdown will be installed root-owned at a system path (e.g."
+        echo "/usr/local/bin). Root ownership at a fixed path is what makes a"
+        echo "sudoers entry safe — it prevents the regular user from replacing the"
+        echo "script with arbitrary code."
+        read -rp "Install docker-lockdown to [${DEFAULT_DL_INSTALL}]: " INPUT_DL_INSTALL
+        DOCKER_LOCKDOWN_PATH="${INPUT_DL_INSTALL:-$DEFAULT_DL_INSTALL}"
+
+        if [ ! -f "$DOCKER_LOCKDOWN_PATH" ] || ! diff -q "$SCRIPT_DIR/docker-lockdown" "$DOCKER_LOCKDOWN_PATH" &>/dev/null; then
+            echo "Installing docker-lockdown to $DOCKER_LOCKDOWN_PATH..."
+            sudo cp "$SCRIPT_DIR/docker-lockdown" "$DOCKER_LOCKDOWN_PATH"
+            sudo chown root:root "$DOCKER_LOCKDOWN_PATH"
+            sudo chmod 755 "$DOCKER_LOCKDOWN_PATH"
+            echo "Installed: $DOCKER_LOCKDOWN_PATH"
+        fi
+
+        DL_SUDO_OK=false
+        sudo -n "$DOCKER_LOCKDOWN_PATH" --help &>/dev/null 2>&1 && DL_SUDO_OK=true
+        if $DL_SUDO_OK; then
+            echo ""
+            echo "Passwordless sudo: OK"
+            echo "Automated tools (web dashboards, scripts) can apply/remove"
+            echo "lockdown rules for this container without a password prompt."
+        else
+            echo ""
+            echo "This is optional. Strict mode works either way:"
+            echo "  With passwordless sudo:    automated tools (web dashboards, scripts)"
+            echo "                             can manage lockdown rules without prompting."
+            echo "  Without passwordless sudo: './start-container' and './stop-container'"
+            echo "                             will prompt for your sudo password each time."
+            echo ""
+            read -rp "Configure passwordless sudo now? [Y/n]: " INPUT_PWLESS
+            INPUT_PWLESS="${INPUT_PWLESS:-Y}"
+            if [[ "$INPUT_PWLESS" =~ ^[Yy]$ ]]; then
+                _sudoers_file="/etc/sudoers.d/$(whoami)-docker-lockdown"
+                _sudoers_line="$(whoami) ALL=(ALL) NOPASSWD: $DOCKER_LOCKDOWN_PATH"
+                echo "Creating $_sudoers_file with:"
+                echo "  $_sudoers_line"
+                echo "$_sudoers_line" | sudo tee "$_sudoers_file" > /dev/null
+                sudo chmod 440 "$_sudoers_file"
+                if sudo -n "$DOCKER_LOCKDOWN_PATH" --help &>/dev/null 2>&1; then
+                    echo "Passwordless sudo: OK"
+                else
+                    echo "Warning: sudoers entry created but verification failed."
+                    echo "Check $_sudoers_file manually."
+                fi
+            else
+                echo ""
+                echo "Skipped. Strict mode set — sudo will prompt when starting/stopping."
+                echo "Re-run ./setup to configure passwordless sudo later."
+            fi
+        fi
+    else
+        SECURITY_LEVEL="open"
+        DOCKER_LOCKDOWN_PATH=""
+        LOCKDOWN_PORT_MIN=""
+        LOCKDOWN_PORT_MAX=""
+        echo ""
+        echo "Lockdown disabled. Container will start without outbound restrictions."
+    fi
+fi
+
+# --- HTTPS / TLS ---
+echo ""
+echo "=== HTTPS / TLS ==="
+echo "TLS encrypts traffic between your browser and the container. The certificate is"
+echo "generated on this host during setup so its fingerprint stays stable — you accept"
+echo "the browser warning once, not on every restart."
+echo ""
+echo "A shared host certificate (default ${HOME}/.local/share/certs) can be reused by"
+echo "every container on this host, so you trust it once for all of them. You can"
+echo "instead generate a per-container cert in ./certs, or skip TLS and serve HTTP."
+echo ""
+
+CURRENT_HTTPS="${USE_HTTPS:-false}"
+_default_enable="N"; [ "$CURRENT_HTTPS" = "true" ] && _default_enable="Y"
+read -rp "Enable HTTPS? [${_default_enable}]: " _https_in
+_https_in="${_https_in:-$_default_enable}"
+
+USE_HTTPS="false"
+if [[ "$_https_in" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo "Certificate source:"
+    echo "  1) Shared host certificate (preferred) — reused by all containers on this host"
+    echo "  2) Per-container certificate — generated in ./certs, used only by dgx-nettest"
+    read -rp "Choice [1]: " _cert_choice
+    if [ "${_cert_choice:-1}" = "2" ]; then
+        # Per-container cert: HOST_CERT_DIR empty → compose mounts ./certs
+        HOST_CERT_DIR=""
+        if [ -f "$SCRIPT_DIR/certs/cert.pem" ]; then
+            _exp="$(openssl x509 -enddate -noout -in "$SCRIPT_DIR/certs/cert.pem" 2>/dev/null | cut -d= -f2)"
+            echo "Existing per-container cert (expires: ${_exp})."
+            read -rp "Regenerate it? [y/N]: " _regen
+            [[ "${_regen:-N}" =~ ^[Yy]$ ]] && gen_cert "$SCRIPT_DIR/certs" 365
+        else
+            gen_cert "$SCRIPT_DIR/certs" 365
+        fi
+        USE_HTTPS="true"
+    else
+        _default_cert_dir="${HOST_CERT_DIR:-${HOME}/.local/share/certs}"
+        read -rp "Shared cert directory [${_default_cert_dir}]: " _in
+        HOST_CERT_DIR="${_in:-$_default_cert_dir}"
+        if [ -f "${HOST_CERT_DIR}/cert.pem" ]; then
+            _exp="$(openssl x509 -enddate -noout -in "${HOST_CERT_DIR}/cert.pem" 2>/dev/null | cut -d= -f2)"
+            echo "Existing shared cert (expires: ${_exp})."
+            read -rp "Regenerate it? [y/N]: " _regen
+            if [[ "${_regen:-N}" =~ ^[Yy]$ ]]; then
+                gen_cert "$HOST_CERT_DIR" 3650
+                show_trust_instructions "${HOST_CERT_DIR}/cert.pem"
+            fi
+        else
+            echo "No shared cert at ${HOST_CERT_DIR} — generating one."
+            gen_cert "$HOST_CERT_DIR" 3650
+            show_trust_instructions "${HOST_CERT_DIR}/cert.pem"
+        fi
+        USE_HTTPS="true"
+    fi
+else
+    echo "HTTPS disabled. dgx-nettest will serve plain HTTP."
+fi
+
+# Ensure ./certs exists so the unconditional compose mount doesn't create it root-owned.
+mkdir -p "$SCRIPT_DIR/certs"
+
+# --- Restart policy ---
+echo ""
+echo "=== Restart Policy ==="
+CURRENT_RESTART="${RESTART_POLICY:-no}"
+echo "What should happen if the container exits unexpectedly or the host reboots:"
+echo "  1) no (default)   — never auto-restart; you must start it manually."
+echo "                       Safest: crashes are immediately visible and require"
+echo "                       operator attention before the service returns."
+echo "  2) unless-stopped — restart on crash or host reboot; respects"
+echo "                       ./stop-container (explicit stop is honoured)."
+echo ""
+echo "  ########################################################################"
+echo "  # WARNING (option 2): if the container is OOM-killed by the OS, it    #"
+echo "  # will restart and be OOM-killed again, looping until you intervene.  #"
+echo "  # Only choose this if you need this container running 24/7 and the    #"
+echo "  # resource limits in .env are known-good for your workload.           #"
+echo "  ########################################################################"
+echo ""
+_restart_default="1"; [ "$CURRENT_RESTART" = "unless-stopped" ] && _restart_default="2"
+read -rp "Choice [${_restart_default}]: " _restart_in
+case "${_restart_in:-$_restart_default}" in
+    2) RESTART_POLICY="unless-stopped" ;;
+    *) RESTART_POLICY="no" ;;
+esac
+echo "Restart policy: $RESTART_POLICY"
+
+cat > "$ENV_FILE" <<EOF
+CONTAINER_UID=${CONTAINER_UID}
+HOST_PORT=${HOST_PORT}
+SECURITY_LEVEL=${SECURITY_LEVEL}
+DOCKER_LOCKDOWN_PATH=${DOCKER_LOCKDOWN_PATH}
+USE_HTTPS=${USE_HTTPS}
+HOST_CERT_DIR=${HOST_CERT_DIR}
+RESTART_POLICY=${RESTART_POLICY}
+CPU_LIMIT=${CPU_LIMIT}
+MEM_LIMIT=${MEM_LIMIT}
+PIDS_LIMIT=${PIDS_LIMIT}
+TMP_SIZE=${TMP_SIZE}
+RUN_SIZE=${RUN_SIZE}
+EOF
+
+echo ""
+echo "Wrote .env:"
+cat "$ENV_FILE"
+echo ""
+echo "Setup complete. Run './start-container' to build and start."
+echo ""
+echo "Resource limits (CPU_LIMIT, MEM_LIMIT, PIDS_LIMIT, TMP_SIZE, RUN_SIZE) ship with"
+echo "sensible defaults so strict mode starts immediately. To tighten them to measured"
+echo "usage, run './start-container --open', exercise the service, then './stop-container'"
+echo "for suggested values — see README.md."

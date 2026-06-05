@@ -1,0 +1,196 @@
+#!/bin/bash
+# Runs the container in open then strict mode, executes security-check in each,
+# and prints a side-by-side comparison of results.
+set -eu
+cd "$(dirname "$0")"
+
+COMPOSE_FILE="docker-compose.yml"
+ENV_FILE=".env"
+WITHOUT_TOOLS_FLAG=""
+
+usage() {
+    cat <<EOF
+Usage: ./security-compare [--no-tools] [-h]
+
+  --no-tools  Exclude diagnostic tools. Outbound tests will be skipped.
+              (Tools are included by default; overhead is ~10 MB.)
+  -h          Show this help.
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-tools) WITHOUT_TOOLS_FLAG="--without-tools" ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $arg"; usage; exit 1 ;;
+    esac
+done
+
+# Load container name
+CONTAINER=$(grep 'container_name:' "$COMPOSE_FILE" | head -1 | awk '{print $2}')
+if [ -z "$CONTAINER" ]; then
+    echo "Error: no container_name found in $COMPOSE_FILE"
+    exit 1
+fi
+
+# Check no container already running
+if docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    echo "Error: container '$CONTAINER' is already running."
+    echo "Stop it first with: ./stop-container"
+    exit 1
+fi
+
+# Verify passwordless sudo is working for docker-lockdown (the only sudo needed).
+_dl=$(grep '^DOCKER_LOCKDOWN_PATH=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)
+if ! sudo -n "${_dl:-/usr/local/bin/docker-lockdown}" --help &>/dev/null; then
+    echo "Passwordless sudo for docker-lockdown is not configured."
+    echo "Run ./setup and answer Y to 'Configure passwordless sudo now?'"
+    exit 1
+fi
+
+# Resource limits use soft defaults (compose ${VAR:-default}), so strict mode
+# starts even if .env has none set — no preflight gate needed here.
+
+# Temp files for capturing security-check output
+OPEN_OUT=$(mktemp /tmp/security-compare-open.XXXXXX)
+STRICT_OUT=$(mktemp /tmp/security-compare-strict.XXXXXX)
+
+cleanup() {
+    if docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+        echo ""
+        echo "Cleaning up: stopping container..."
+        ./stop-container
+    fi
+    rm -f "$OPEN_OUT" "$STRICT_OUT"
+}
+trap cleanup EXIT
+
+run_phase() {
+    local mode="$1"
+    local outfile="$2"
+    shift 2
+
+    echo ""
+    echo "========================================"
+    echo "  Phase: ${mode} mode"
+    echo "========================================"
+    echo "Starting container..."
+    ./start-container "--${mode}" $WITHOUT_TOOLS_FLAG "$@"
+
+    echo ""
+    echo "Running security-check..."
+    ./security-check "$CONTAINER" | tee "$outfile"
+
+    echo ""
+    echo "Stopping container..."
+    ./stop-container
+}
+
+# Clear any stale iptables rules from previous runs before starting
+echo "Clearing stale iptables rules..."
+_dl=$(grep '^DOCKER_LOCKDOWN_PATH=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)
+sudo "${_dl:-docker-lockdown}" cleanup || true
+
+run_phase "open"   "$OPEN_OUT"              # first run builds
+run_phase "strict" "$STRICT_OUT" --no-build # second run reuses built image
+
+echo ""
+echo "========================================"
+echo "  Comparison"
+echo "========================================"
+echo ""
+
+python3 - "$OPEN_OUT" "$STRICT_OUT" <<'PYEOF'
+import sys, re
+
+ANSI   = re.compile(r'\033\[[0-9;]*m')
+GREEN  = '\033[32m'
+RED    = '\033[31m'
+YELLOW = '\033[33m'
+RESET  = '\033[0m'
+
+def fmt(status, word=''):
+    label = status + (f' ({word})' if word else '')
+    color = {'PASS': GREEN, 'FAIL': RED, 'SKIP': YELLOW}.get(status, '')
+    reset = RESET if color else ''
+    return color + label + reset, len(label)
+
+def canonical(name):
+    name = re.sub(r'\s+\[.*\]$', '', name)   # strip [detail] from FAIL messages
+    name = re.sub(r'\s+—\s+.*$', '', name)   # strip — reason from SKIP messages
+    return name.strip()
+
+def parse(filepath):
+    # Returns ordered list of (status, word, canonical_name)
+    results = []
+    with open(filepath) as f:
+        for line in f:
+            line = ANSI.sub('', line)
+            m = re.match(r'\s+(PASS|FAIL|SKIP)(?:\s+\(([^)]+)\))?: (.+)$', line)
+            if m:
+                status = m.group(1)
+                word   = m.group(2) or ''
+                name   = canonical(m.group(3))
+                results.append((status, word, name))
+    return results
+
+open_r   = parse(sys.argv[1])
+strict_r = parse(sys.argv[2])
+
+# Build name -> (status, word) lookup
+open_map = {}
+for status, word, name in open_r:
+    if name not in open_map:
+        open_map[name] = (status, word)
+
+strict_map = {}
+for status, word, name in strict_r:
+    if name not in strict_map:
+        strict_map[name] = (status, word)
+
+# Ordered list of all test names: open mode order first, then any strict-only extras
+seen = set()
+ordered = []
+for _, _, name in open_r:
+    if name not in seen:
+        ordered.append(name)
+        seen.add(name)
+for _, _, name in strict_r:
+    if name not in seen:
+        ordered.append(name)
+        seen.add(name)
+
+# Column width: wide enough for the longest status+word label
+def label_len(status, word):
+    return len(status) + (len(word) + 3 if word else 0)  # +3 for ' ()'
+
+all_entries = list(open_map.values()) + list(strict_map.values())
+col_width = max((label_len(s, w) for s, w in all_entries), default=4) + 2
+
+name_width = min(max((len(n) for n in ordered), default=20) + 2, 56)
+print(f"{'Test':<{name_width}}  {'Open':<{col_width}}Strict")
+print('-' * (name_width + col_width + 8))
+
+for name in ordered:
+    o_status, o_word = open_map.get(name, ('N/A', ''))
+    s_status, s_word = strict_map.get(name, ('N/A', ''))
+    display = name if len(name) <= name_width - 2 else name[:name_width - 5] + '...'
+    o_colored, o_len = fmt(o_status, o_word)
+    s_colored, _     = fmt(s_status, s_word)
+    o_pad = ' ' * (col_width - o_len)
+    print(f"{display:<{name_width}}  {o_colored}{o_pad}{s_colored}")
+
+print()
+
+def counts(results):
+    c = {'PASS': 0, 'FAIL': 0, 'SKIP': 0}
+    for s, _, _ in results:
+        if s in c:
+            c[s] += 1
+    return c
+
+oc = counts(open_r)
+sc = counts(strict_r)
+print(f"Open:   {GREEN}{oc['PASS']} passed{RESET}, {RED}{oc['FAIL']} failed{RESET}, {YELLOW}{oc['SKIP']} skipped{RESET}")
+print(f"Strict: {GREEN}{sc['PASS']} passed{RESET}, {RED}{sc['FAIL']} failed{RESET}, {YELLOW}{sc['SKIP']} skipped{RESET}")
+PYEOF

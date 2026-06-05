@@ -1,0 +1,173 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")"
+
+COMPOSE_FILE="docker-compose.yml"
+ENV_FILE=".env"
+
+usage() {
+    cat <<EOF
+Usage: ./start-container [--strict|--open] [--without-tools] [--no-build] [-h]
+
+  --strict      Block all container-initiated outbound traffic (default).
+                Requires sudo to apply iptables rules via docker-lockdown.
+  --open        No traffic restrictions. Process hardening only. No sudo needed.
+  --without-tools  Exclude network diagnostic tools (curl, dig, ping, nc, traceroute, wget).
+                   Triggers a rebuild. Default is to include them (~10 MB, negligible vs image size).
+  --no-build       Skip the docker compose build step. Use when the image is already built
+                   and you just want to (re)start the container.
+  -h            Show this help.
+EOF
+}
+
+# --- Parse args ---
+_saved_level=$(grep '^SECURITY_LEVEL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)
+SECURITY_LEVEL="${_saved_level:-strict}"
+INCLUDE_TOOLS="true"
+NO_BUILD="false"
+for arg in "$@"; do
+    case "$arg" in
+        --strict)        SECURITY_LEVEL="strict" ;;
+        --open)          SECURITY_LEVEL="open" ;;
+        --without-tools) INCLUDE_TOOLS="false" ;;
+        --no-build)      NO_BUILD="true" ;;
+        -h|--help)       usage; exit 0 ;;
+        *) echo "Unknown option: $arg"; usage; exit 1 ;;
+    esac
+done
+
+# --- Load container name from compose ---
+CONTAINER=$(grep 'container_name:' "$COMPOSE_FILE" | head -1 | awk '{print $2}')
+if [ -z "$CONTAINER" ]; then
+    echo "Error: no container_name found in $COMPOSE_FILE"
+    exit 1
+fi
+
+# --- Set compose command ---
+if [ "$SECURITY_LEVEL" = "strict" ]; then
+    COMPOSE_CMD="docker compose -f docker-compose.yml -f docker-compose.strict.yml"
+else
+    COMPOSE_CMD="docker compose"
+fi
+
+# --- Check if already running ---
+if docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    echo "Container '$CONTAINER' is already running."
+    read -rp "Restart it? [y/N] " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        echo "Stopping..."
+        ./stop-container
+    else
+        echo "Exiting."
+        exit 0
+    fi
+fi
+
+# --- Check .env variables ---
+REQUIRED_VARS="CONTAINER_UID HOST_PORT"
+MISSING=()
+
+if [ ! -f "$ENV_FILE" ]; then
+    MISSING=($REQUIRED_VARS)
+else
+    for var in $REQUIRED_VARS; do
+        val=$(grep "^${var}=" "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
+        if [ -z "$val" ]; then
+            MISSING+=("$var")
+        fi
+    done
+fi
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "Missing .env variables: ${MISSING[*]}"
+    echo "Running setup..."
+    echo ""
+    ./setup
+fi
+
+# --- Write build/runtime vars to .env ---
+for entry in "SECURITY_LEVEL=${SECURITY_LEVEL}" "INCLUDE_TOOLS=${INCLUDE_TOOLS}"; do
+    key="${entry%%=*}"
+    if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${entry}|" "$ENV_FILE"
+    else
+        echo "$entry" >> "$ENV_FILE"
+    fi
+done
+
+# .env is operator-controlled; sourcing it is intentional
+source "$ENV_FILE"
+
+# --- Resolve protocol (TLS) ---
+USE_HTTPS="${USE_HTTPS:-false}"
+PROTO="http"
+CURL_K=""
+if [ "$USE_HTTPS" = "true" ]; then
+    PROTO="https"
+    CURL_K="-k"
+    _cert_dir="${HOST_CERT_DIR:-./certs}"
+    if [ ! -f "${_cert_dir}/cert.pem" ]; then
+        echo "Error: USE_HTTPS=true but ${_cert_dir}/cert.pem not found. Run ./setup."
+        exit 1
+    fi
+fi
+
+# Resource limits ship with soft defaults (.env / compose), so strict mode starts
+# out of the box. Run --open then ./stop-container to profile and tighten them.
+
+# --- Build ---
+if [ "$NO_BUILD" = "false" ]; then
+    echo "Building $CONTAINER..."
+    if ! $COMPOSE_CMD build --quiet 2>&1; then
+        echo "Build failed. Run '$COMPOSE_CMD build' to see full output."
+        exit 1
+    fi
+    echo "Build succeeded."
+fi
+
+# --- Start ---
+echo "Starting $CONTAINER..."
+if [ "$SECURITY_LEVEL" = "strict" ]; then
+    _dl="${DOCKER_LOCKDOWN_PATH:-docker-lockdown}"
+    # Start first so Docker assigns the network IP, then apply lockdown immediately.
+    $COMPOSE_CMD up -d
+    sudo "$_dl" apply "$CONTAINER" "$HOST_PORT"
+else
+    echo ""
+    echo "########################################################"
+    echo "# WARNING: starting WITHOUT outbound network lockdown. #"
+    echo "# This container can make unrestricted outbound        #"
+    echo "# connections. Run ./setup to enable lockdown.         #"
+    echo "########################################################"
+    echo ""
+    $COMPOSE_CMD up -d
+fi
+
+# --- Health check loop ---
+HEALTH_URL="${PROTO}://localhost:${HOST_PORT}/health"
+MAX_WAIT=${MAX_WAIT:-600}
+INTERVAL=3
+ELAPSED=0
+
+echo "Waiting for health check at $HEALTH_URL ..."
+while [ $ELAPSED -lt $MAX_WAIT ]; do
+    HTTP_CODE=$(curl -s $CURL_K -o /dev/null -w '%{http_code}' --max-time 3 "$HEALTH_URL" 2>/dev/null || true)
+    if [ "$HTTP_CODE" = "200" ]; then
+        break
+    fi
+    printf "."
+    sleep $INTERVAL
+    ELAPSED=$((ELAPSED + INTERVAL))
+done
+
+if [ "$HTTP_CODE" != "200" ]; then
+    echo ""
+    echo "Error: health check did not pass within ${MAX_WAIT}s"
+    echo "Check logs: docker compose logs"
+    exit 1
+fi
+
+echo ""
+echo "Container '$CONTAINER' is healthy."
+echo "  ${PROTO}://$(hostname):${HOST_PORT}/"
+echo ""

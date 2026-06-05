@@ -1,0 +1,109 @@
+#!/bin/bash
+set -eu
+cd "$(dirname "$0")"
+
+COMPOSE_FILE="docker-compose.yml"
+ENV_FILE=".env"
+
+# --- Load container name from compose ---
+CONTAINER=$(grep 'container_name:' "$COMPOSE_FILE" | head -1 | awk '{print $2}')
+if [ -z "$CONTAINER" ]; then
+    echo "Error: no container_name found in $COMPOSE_FILE"
+    exit 1
+fi
+
+# --- Read settings from .env ---
+SECURITY_LEVEL="strict"
+DOCKER_LOCKDOWN_PATH=""
+if [ -f "$ENV_FILE" ]; then
+    val=$(grep '^SECURITY_LEVEL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
+    [ -n "$val" ] && SECURITY_LEVEL="$val"
+    val=$(grep '^DOCKER_LOCKDOWN_PATH=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
+    [ -n "$val" ] && DOCKER_LOCKDOWN_PATH="$val"
+fi
+
+# --- Set compose command to match start mode ---
+if [ "$SECURITY_LEVEL" = "strict" ]; then
+    COMPOSE_CMD="docker compose -f docker-compose.yml -f docker-compose.strict.yml"
+else
+    COMPOSE_CMD="docker compose"
+fi
+
+# --- Capture resource snapshot before stopping (open mode only) ---
+if [ "$SECURITY_LEVEL" = "open" ] && docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    echo "Capturing resource snapshot..."
+    STATS=$(docker stats --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}" "$CONTAINER" 2>/dev/null || true)
+
+    if [ -n "$STATS" ]; then
+        CPU_PCT=$(echo "$STATS" | cut -d'|' -f1 | tr -d '%')
+        MEM_USED=$(echo "$STATS" | cut -d'|' -f2 | awk '{print $1}')
+        PIDS=$(echo "$STATS" | cut -d'|' -f3)
+        TMP_MB=$(docker exec "$CONTAINER" df -BM /tmp 2>/dev/null | awk 'NR==2{gsub(/M/,"",$3); print ($3+0)}' || echo "1")
+        RUN_MB=$(docker exec "$CONTAINER" df -BM /run 2>/dev/null | awk 'NR==2{gsub(/M/,"",$3); print ($3+0)}' || echo "1")
+
+        echo ""
+        echo "Resource usage at stop time (snapshot, not peak):"
+        echo "  CPU:    ${CPU_PCT}%"
+        echo "  Memory: $MEM_USED"
+        echo "  PIDs:   $PIDS"
+        echo "  /tmp:   ${TMP_MB}MiB used"
+        echo "  /run:   ${RUN_MB}MiB used"
+        echo ""
+
+        SUGGESTIONS=$(python3 -c "
+import re, math
+
+# CPU: percentage (100% = 1 core), +25% headroom, round up to nearest 0.25
+cpu = float('$CPU_PCT') / 100
+cpu_limit = max(0.25, (int(cpu * 1.25 / 0.25) + 1) * 0.25)
+
+# Memory: parse value+unit, +25% headroom, round up to nearest 64m
+m = re.match(r'([\d.]+)([kKmMgG])', '$MEM_USED')
+if m:
+    val, u = float(m.group(1)), m.group(2).upper()
+    mb = val / 1024 if u == 'K' else val if u == 'M' else val * 1024
+    mem_limit = (int(mb * 1.25 / 64) + 1) * 64
+else:
+    mem_limit = 256
+
+# PIDs: +50% headroom, round up to nearest 10
+pids_limit = (int(int('$PIDS') * 1.5) // 10 + 1) * 10
+
+# tmpfs: +50% headroom, round up to nearest power of 2, min 16m
+def next_pow2(n): return max(16, 2 ** math.ceil(math.log2(max(2, n))))
+tmp_limit = next_pow2(int(float('$TMP_MB') * 1.5))
+run_limit = next_pow2(int(float('$RUN_MB') * 1.5))
+
+print(f'CPU_LIMIT={cpu_limit:.2f}')
+print(f'MEM_LIMIT={mem_limit}m')
+print(f'PIDS_LIMIT={pids_limit}')
+print(f'TMP_SIZE={tmp_limit}m')
+print(f'RUN_SIZE={run_limit}m')
+" 2>/dev/null)
+
+        if [ -n "$SUGGESTIONS" ]; then
+            echo "Suggested .env values (headroom applied):"
+            while IFS= read -r line; do
+                echo "  $line"
+            done <<< "$SUGGESTIONS"
+            echo ""
+            echo "Tip: for CPU/memory accuracy, capture stats while the container is under load."
+            echo "Add the values above to .env, then run './start-container --strict'."
+        fi
+    fi
+fi
+
+# --- Stop container ---
+if docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    echo "Stopping $CONTAINER..."
+    $COMPOSE_CMD down
+    echo "Container '$CONTAINER' stopped."
+else
+    echo "Container '$CONTAINER' is not running."
+    $COMPOSE_CMD down 2>/dev/null || true
+fi
+
+# --- Remove lockdown rules (strict mode only) ---
+if [ "$SECURITY_LEVEL" = "strict" ]; then
+    sudo "${DOCKER_LOCKDOWN_PATH:-docker-lockdown}" remove "$CONTAINER"
+fi

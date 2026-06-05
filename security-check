@@ -1,0 +1,406 @@
+#!/bin/bash
+# Verify container security posture.
+# In strict mode: confirms outbound traffic is blocked and iptables rules are in place.
+# In open mode: confirms outbound traffic is allowed, no blocking rules exist, and process hardening is intact.
+# Usage: ./security-check [container-name]
+# Requires passwordless sudo for docker-lockdown (configured by ./setup).
+set -u
+
+# Resolve docker-lockdown path from .env (falls back to the standard install path).
+_DL=$(grep '^DOCKER_LOCKDOWN_PATH=' .env 2>/dev/null | cut -d= -f2- || true)
+_DL="${_DL:-/usr/local/bin/docker-lockdown}"
+
+CONTAINER="${1:-}"
+if [ -z "$CONTAINER" ]; then
+    if [ -f docker-compose.yml ]; then
+        CONTAINER=$(grep 'container_name:' docker-compose.yml | head -1 | awk '{print $2}')
+    fi
+    if [ -z "$CONTAINER" ]; then
+        echo "Usage: $0 [container-name]"
+        echo "  (or run from a directory with docker-compose.yml containing container_name)"
+        exit 1
+    fi
+    echo "No argument given — found container_name: $CONTAINER in docker-compose.yml"
+    echo ""
+fi
+
+if ! docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+    echo "Error: container '$CONTAINER' is not running"
+    exit 1
+fi
+
+CONTAINER_IP=$(docker inspect "$CONTAINER" --format '{{range $net, $config := .NetworkSettings.Networks}}{{$config.IPAddress}}{{end}}')
+PREFIX_LEN=$(docker inspect "$CONTAINER" --format '{{range $net, $config := .NetworkSettings.Networks}}{{$config.IPPrefixLen}}{{end}}')
+HOST_PORT=$(docker inspect "$CONTAINER" --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{if $bindings}}{{(index $bindings 0).HostPort}}{{end}}{{end}}')
+GATEWAY=$(docker inspect "$CONTAINER" --format '{{range $net, $config := .NetworkSettings.Networks}}{{$config.Gateway}}{{end}}')
+
+SUBNET=$(python3 -c "
+import ipaddress
+net = ipaddress.ip_network('${CONTAINER_IP}/${PREFIX_LEN}', strict=False)
+print(net)
+")
+
+_env=$(docker inspect "$CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}')
+SECURITY_LEVEL=$(echo "$_env" | grep '^SECURITY_LEVEL=' | cut -d= -f2 || true)
+SECURITY_LEVEL="${SECURITY_LEVEL:-strict}"
+USE_HTTPS=$(echo "$_env" | grep '^USE_HTTPS=' | cut -d= -f2 || true)
+USE_HTTPS="${USE_HTTPS:-false}"
+PROTO="http"; CURL_K=""
+[ "$USE_HTTPS" = "true" ] && PROTO="https" && CURL_K="-k"
+
+echo "Container:  $CONTAINER"
+echo "IP:         $CONTAINER_IP"
+echo "Subnet:     $SUBNET"
+echo "Host port:  $HOST_PORT"
+echo "Gateway:    $GATEWAY"
+echo "Mode:       $SECURITY_LEVEL"
+echo "Protocol:   $PROTO"
+echo ""
+
+PASS=0
+FAIL=0
+SKIP=0
+RESULTS=()
+GREEN='\033[32m'
+RED='\033[31m'
+YELLOW='\033[33m'
+RESET='\033[0m'
+
+# Each result is stored as STATUS|name|word where word describes the outcome
+# (e.g. "allowed", "blocked", "true", "ok") and is shown in parentheses.
+pass() {
+    local name="$1" word="${2:-}"
+    printf "  ${GREEN}PASS${word:+ ($word)}${RESET}: %s\n" "$name"
+    ((PASS++))
+    RESULTS+=("PASS|$name|$word")
+}
+fail() {
+    local name="$1" word="${2:-}"
+    printf "  ${RED}FAIL${word:+ ($word)}${RESET}: %s\n" "$name"
+    ((FAIL++))
+    RESULTS+=("FAIL|$name|$word")
+}
+skip() {
+    echo "  SKIP: $1 — $2"
+    ((SKIP++))
+    RESULTS+=("SKIP|$1|")
+}
+
+# ── Sequential checks ─────────────────────────────────────────────────────
+
+echo "=== DOCKER-USER rules check ==="
+
+RULE_NAME="DOCKER-USER rules for $SUBNET"
+# docker-lockdown tags its rules with a comment ("lockdown:<container>:<port>").
+# iptables -C requires an exact match including the comment, so we use -S + grep.
+_dl_rules=$(sudo "$_DL" status 2>/dev/null || true)
+if [ "$SECURITY_LEVEL" = "strict" ]; then
+    RETURN_OK=false; DROP_OK=false
+    # Filter to lines tagged with this container's lockdown comment, then check
+    # for each target. Check -j RETURN (not ctstate text) because some iptables
+    # versions sort ctstate values alphabetically in -S output (RELATED,ESTABLISHED
+    # instead of ESTABLISHED,RELATED), which would break a text match.
+    if echo "$_dl_rules" | grep "lockdown:${CONTAINER}:" | grep -q "\-j RETURN"; then RETURN_OK=true; fi
+    if echo "$_dl_rules" | grep "lockdown:${CONTAINER}:" | grep -q "\-j DROP";   then DROP_OK=true;   fi
+    if $RETURN_OK && $DROP_OK; then
+        pass "$RULE_NAME" "present"
+    else
+        MISSING=""
+        $RETURN_OK || MISSING="ESTABLISHED/RELATED RETURN"
+        $DROP_OK   || MISSING="${MISSING:+$MISSING, }DROP"
+        fail "$RULE_NAME [missing: $MISSING]" "missing"
+        echo ""
+        echo "  Run these commands to add the missing rules:"
+        echo "    sudo iptables -I DOCKER-USER -s $SUBNET -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
+        echo "    sudo iptables -A DOCKER-USER -s $SUBNET -j DROP"
+        echo "  Then re-run this script."
+        echo ""
+        echo "Results: $PASS passed, $FAIL failed, $SKIP skipped  —  SOME TESTS FAILED"
+        exit 1
+    fi
+else
+    if echo "$_dl_rules" | grep -q "lockdown:${CONTAINER}:"; then
+        fail "$RULE_NAME [lockdown rules present — stale from a previous strict run]" "present"
+    else
+        pass "$RULE_NAME" "absent"
+    fi
+fi
+echo ""
+
+echo "=== Identity ==="
+
+PROC_UID=$(docker exec "$CONTAINER" cat /proc/1/status | grep '^Uid:' | awk '{print $2}')
+[ "$PROC_UID" != "0" ] && pass "PID 1 not root [UID $PROC_UID]" "true" || fail "PID 1 not root [running as root]" "false"
+
+PROC_GID=$(docker exec "$CONTAINER" cat /proc/1/status | grep '^Gid:' | awk '{print $2}')
+[ "$PROC_GID" = "$PROC_UID" ] && pass "PID 1 GID matches UID" "true" || fail "PID 1 GID matches UID [GID $PROC_GID != UID $PROC_UID]" "false"
+
+CAP_EFF=$(docker exec "$CONTAINER" cat /proc/1/status | grep '^CapEff:' | awk '{print $2}')
+[ "$CAP_EFF" = "0000000000000000" ] && pass "PID 1 no effective capabilities" "true" || fail "PID 1 no effective capabilities [CapEff: $CAP_EFF]" "false"
+
+echo ""
+echo "=== Inbound ==="
+
+HTTP_CODE=$(curl -s $CURL_K -o /dev/null -w '%{http_code}' --max-time 5 "${PROTO}://localhost:${HOST_PORT}/health")
+[ "$HTTP_CODE" = "200" ] && pass "Health check port $HOST_PORT" "ok" || fail "Health check port $HOST_PORT [got $HTTP_CODE]" "failed"
+
+echo ""
+echo "=== Diagnostic tools ==="
+
+MISSING_TOOLS=()
+for tool in dig ping curl nc; do
+    if ! docker exec "$CONTAINER" which "$tool" >/dev/null 2>&1; then
+        MISSING_TOOLS+=("$tool")
+    fi
+done
+
+if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+    echo "  Missing tools: ${MISSING_TOOLS[*]} — image built with --without-tools; rebuild without that flag to include tools"
+else
+    echo "  All diagnostic tools present."
+fi
+
+has_tool() { ! printf '%s\n' "${MISSING_TOOLS[@]}" | grep -qx "$1"; }
+
+# ── Outbound tests — run in parallel to avoid stacking up timeouts ────────
+# Each function writes one line to a temp file:
+#   PASS|name|word   FAIL|name|word   SKIP|name|reason
+# Results are collected below in display order after all tests finish.
+
+OUTBOUND_DIR=$(mktemp -d)
+trap 'rm -rf "$OUTBOUND_DIR"' EXIT
+
+_test_dns_dig() {
+    local result
+    if ! has_tool dig; then
+        result="SKIP|DNS resolution (dig)|image built with --without-tools; run: ./start-container (default includes tools)"
+    else
+        local out; out=$(docker exec "$CONTAINER" dig +short +time=2 +tries=1 google.com 2>&1)
+        local blocked=false
+        echo "$out" | grep -q "no servers could be reached\|timed out\|connection refused" && blocked=true
+        if [ "$SECURITY_LEVEL" = "strict" ]; then
+            $blocked && result="PASS|DNS resolution (dig)|blocked" \
+                     || result="FAIL|DNS resolution (dig) [got: $(echo "$out" | head -1)]|allowed"
+        else
+            $blocked && result="FAIL|DNS resolution (dig) [blocked — stale rule?]|blocked" \
+                     || result="PASS|DNS resolution (dig)|allowed"
+        fi
+    fi
+    echo "$result" > "$OUTBOUND_DIR/dns_dig"
+}
+
+_test_dns_python() {
+    local out; out=$(docker exec "$CONTAINER" python3 -c "
+import socket
+try:
+    socket.setdefaulttimeout(3)
+    result = socket.getaddrinfo('google.com', 80)
+    print('RESOLVED:' + result[0][4][0])
+except Exception as e:
+    print('BLOCKED:' + str(e))
+" 2>&1)
+    local result
+    if [ "$SECURITY_LEVEL" = "strict" ]; then
+        echo "$out" | grep -q "^BLOCKED:" \
+            && result="PASS|DNS resolution (python socket)|blocked" \
+            || result="FAIL|DNS resolution (python socket) [got: $(echo "$out" | head -1)]|allowed"
+    else
+        echo "$out" | grep -q "^RESOLVED:" \
+            && result="PASS|DNS resolution (python socket)|allowed" \
+            || result="FAIL|DNS resolution (python socket) [blocked]|blocked"
+    fi
+    echo "$result" > "$OUTBOUND_DIR/dns_python"
+}
+
+_test_ping() {
+    local result
+    if ! has_tool ping; then
+        result="SKIP|Ping to 1.1.1.1|image built with --without-tools; run: ./start-container (default includes tools)"
+    else
+        local out; out=$(docker exec "$CONTAINER" ping -c 1 -W 3 1.1.1.1 2>&1)
+        local ok=false; echo "$out" | grep -q "64 bytes" && ok=true
+        # "Operation not permitted" means no NET_RAW and ICMP echo sockets are
+        # unavailable — a capability limit, not a network block. Skip rather than
+        # misreport as a lockdown failure.
+        if echo "$out" | grep -q "Operation not permitted\|permission denied\|socket: "; then
+            result="SKIP|Ping to 1.1.1.1|no NET_RAW capability (cap_drop:ALL) — not a network test"
+        elif [ "$SECURITY_LEVEL" = "strict" ]; then
+            $ok && result="FAIL|Ping to 1.1.1.1 [succeeded]|allowed" \
+               || result="PASS|Ping to 1.1.1.1|blocked"
+        else
+            $ok && result="PASS|Ping to 1.1.1.1|allowed" \
+               || result="FAIL|Ping to 1.1.1.1 [blocked]|blocked"
+        fi
+    fi
+    echo "$result" > "$OUTBOUND_DIR/ping"
+}
+
+_test_http() {
+    local result
+    if ! has_tool curl; then
+        result="SKIP|HTTP to 1.1.1.1|image built with --without-tools; run: ./start-container (default includes tools)"
+    else
+        local code; code=$(docker exec "$CONTAINER" curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://1.1.1.1 2>&1)
+        local blocked=false
+        { [ "$code" = "000" ] || echo "$code" | grep -q "timed out\|Connection refused\|couldn't connect"; } && blocked=true
+        if [ "$SECURITY_LEVEL" = "strict" ]; then
+            $blocked && result="PASS|HTTP to 1.1.1.1|blocked" \
+                     || result="FAIL|HTTP to 1.1.1.1 [status: $code]|allowed"
+        else
+            $blocked && result="FAIL|HTTP to 1.1.1.1 [blocked]|blocked" \
+                     || result="PASS|HTTP to 1.1.1.1|allowed"
+        fi
+    fi
+    echo "$result" > "$OUTBOUND_DIR/http"
+}
+
+_test_https() {
+    local result
+    if ! has_tool curl; then
+        result="SKIP|HTTPS to 1.1.1.1|image built with --without-tools; run: ./start-container (default includes tools)"
+    else
+        local code; code=$(docker exec "$CONTAINER" curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://1.1.1.1 2>&1)
+        local blocked=false
+        { [ "$code" = "000" ] || echo "$code" | grep -q "timed out\|Connection refused\|couldn't connect"; } && blocked=true
+        if [ "$SECURITY_LEVEL" = "strict" ]; then
+            $blocked && result="PASS|HTTPS to 1.1.1.1|blocked" \
+                     || result="FAIL|HTTPS to 1.1.1.1 [status: $code]|allowed"
+        else
+            $blocked && result="FAIL|HTTPS to 1.1.1.1 [blocked]|blocked" \
+                     || result="PASS|HTTPS to 1.1.1.1|allowed"
+        fi
+    fi
+    echo "$result" > "$OUTBOUND_DIR/https"
+}
+
+_test_nc() {
+    local result
+    if ! has_tool nc; then
+        result="SKIP|TCP connect to 1.1.1.1:443|image built with --without-tools; run: ./start-container (default includes tools)"
+    else
+        local out; out=$(docker exec "$CONTAINER" nc -z -w 3 1.1.1.1 443 2>&1; echo "EXIT:$?")
+        local ok=false; echo "$out" | grep -q "EXIT:0" && ok=true
+        if [ "$SECURITY_LEVEL" = "strict" ]; then
+            $ok && result="FAIL|TCP connect to 1.1.1.1:443 [succeeded]|allowed" \
+               || result="PASS|TCP connect to 1.1.1.1:443|blocked"
+        else
+            $ok && result="PASS|TCP connect to 1.1.1.1:443|allowed" \
+               || result="FAIL|TCP connect to 1.1.1.1:443 [blocked]|blocked"
+        fi
+    fi
+    echo "$result" > "$OUTBOUND_DIR/nc"
+}
+
+_test_udp_direct() {
+    local result
+    if ! has_tool dig; then
+        result="SKIP|UDP to 8.8.8.8:53|image built with --without-tools; run: ./start-container (default includes tools)"
+    else
+        local out; out=$(docker exec "$CONTAINER" dig +short +time=2 +tries=1 @8.8.8.8 google.com 2>&1)
+        local ok=false; echo "$out" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && ok=true
+        if [ "$SECURITY_LEVEL" = "strict" ]; then
+            $ok && result="FAIL|UDP to 8.8.8.8:53 [got: $(echo "$out" | head -1)]|allowed" \
+               || result="PASS|UDP to 8.8.8.8:53|blocked"
+        else
+            $ok && result="PASS|UDP to 8.8.8.8:53|allowed" \
+               || result="FAIL|UDP to 8.8.8.8:53 [blocked]|blocked"
+        fi
+    fi
+    echo "$result" > "$OUTBOUND_DIR/udp_direct"
+}
+
+_test_gateway() {
+    local result
+    if ! has_tool curl; then
+        result="SKIP|Gateway $GATEWAY:$HOST_PORT|image built with --without-tools; run: ./start-container (default includes tools)"
+    else
+        # Gateway is always reachable — DOCKER-USER only filters traffic crossing
+        # between the bridge and external interfaces, not bridge-internal traffic.
+        docker exec "$CONTAINER" curl -s $CURL_K -o /dev/null -w '%{http_code}' --max-time 3 "${PROTO}://${GATEWAY}:${HOST_PORT}" 2>&1 || true
+        result="PASS|Gateway $GATEWAY:$HOST_PORT|reachable"
+    fi
+    echo "$result" > "$OUTBOUND_DIR/gateway"
+}
+
+# Launch all outbound tests in parallel
+_test_dns_dig    &
+_test_dns_python &
+_test_ping       &
+_test_http       &
+_test_https      &
+_test_nc         &
+_test_udp_direct &
+_test_gateway    &
+wait
+
+# Collect results in display order
+_collect() {
+    local file="$OUTBOUND_DIR/$1"
+    [ -f "$file" ] || return
+    local status name word
+    IFS='|' read -r status name word < "$file"
+    case "$status" in
+        PASS) pass "$name" "$word" ;;
+        FAIL) fail "$name" "$word" ;;
+        SKIP) skip "$name" "$word" ;;
+    esac
+}
+
+if [ "$SECURITY_LEVEL" = "strict" ]; then
+    DNS_HEADER="=== Outbound DNS (should be blocked) ==="
+    CONN_HEADER="=== Outbound connections (should be blocked) ==="
+else
+    DNS_HEADER="=== Outbound DNS (should be allowed) ==="
+    CONN_HEADER="=== Outbound connections (should be allowed) ==="
+fi
+
+echo ""
+echo "$DNS_HEADER"
+_collect dns_dig
+_collect dns_python
+
+echo ""
+echo "$CONN_HEADER"
+_collect ping
+_collect http
+_collect https
+_collect nc
+_collect udp_direct
+
+echo ""
+echo "=== Gateway reachability ==="
+_collect gateway
+
+# ── Final sequential checks ───────────────────────────────────────────────
+
+echo ""
+echo "=== Inbound still works ==="
+
+HTTP_CODE2=$(curl -s $CURL_K -o /dev/null -w '%{http_code}' --max-time 5 "${PROTO}://localhost:${HOST_PORT}/health")
+[ "$HTTP_CODE2" = "200" ] && pass "Health check after outbound tests" "ok" || fail "Health check after outbound tests [got $HTTP_CODE2]" "failed"
+
+if [ "$SECURITY_LEVEL" = "strict" ]; then
+    echo ""
+    echo "=== DOCKER-USER rules state ==="
+    sudo "$_DL" status 2>/dev/null || true
+fi
+
+echo ""
+echo "=== Summary ==="
+for entry in "${RESULTS[@]}"; do
+    local_status="${entry%%|*}"
+    rest="${entry#*|}"
+    local_name="${rest%%|*}"
+    local_word="${rest##*|}"
+    label="${local_status}${local_word:+ ($local_word)}"
+    case "$local_status" in
+        PASS) printf "  ${GREEN}${label}${RESET} %s\n" "$local_name" ;;
+        FAIL) printf "  ${RED}${label}${RESET} %s\n" "$local_name" ;;
+        SKIP) printf "  ${YELLOW}SKIP${RESET} %s\n" "$local_name" ;;
+    esac
+done
+echo ""
+echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
+if [ "$SKIP" -gt 0 ]; then
+    echo "Image was built with --without-tools. Run ./start-container (default) to rebuild with tools."
+fi

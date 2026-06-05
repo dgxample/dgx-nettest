@@ -1,0 +1,12 @@
+services:
+  dgx-nettest:
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        limits:
+          # Soft defaults so strict mode starts out of the box; setup ships
+          # measured values in .env, and the profiling workflow tightens them.
+          cpus: '${CPU_LIMIT:-1.00}'
+          memory: ${MEM_LIMIT:-256m}
+          pids: ${PIDS_LIMIT:-50}

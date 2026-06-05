@@ -1,0 +1,46 @@
+networks:
+  isolated:
+    driver: bridge
+    enable_ipv6: false
+
+services:
+  dgx-nettest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONTAINER_UID: ${CONTAINER_UID}
+        INCLUDE_TOOLS: ${INCLUDE_TOOLS:-true}
+    image: dgx-nettest:latest
+    container_name: dgx-nettest
+    restart: "${RESTART_POLICY:-no}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETPCAP
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp:size=${TMP_SIZE:-512m},mode=1777
+      - /run:size=${RUN_SIZE:-64m},mode=755
+    environment:
+      - SECURITY_LEVEL=${SECURITY_LEVEL:-strict}
+      - USE_HTTPS=${USE_HTTPS:-false}
+      - APP_PORT=9000
+    networks:
+      - isolated
+    ports:
+      - "${HOST_PORT:-8999}:9000"
+    volumes:
+      # Unconditional: an empty dir mounts harmlessly when USE_HTTPS=false.
+      # HOST_CERT_DIR points at a shared host cert dir; falls back to ./certs.
+      - ${HOST_CERT_DIR:-./certs}:/certs:ro
+    healthcheck:
+      test: [ "CMD", "python3", "/healthcheck.py" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
