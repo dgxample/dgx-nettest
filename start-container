@@ -7,15 +7,19 @@ ENV_FILE=".env"
 
 usage() {
     cat <<EOF
-Usage: ./start-container [--strict|--open] [--without-tools] [--no-build] [-h]
+Usage: ./start-container [--strict|--open] [--without-tools] [--build] [--working] [-h]
 
   --strict      Block all container-initiated outbound traffic (default).
                 Requires sudo to apply iptables rules via docker-lockdown.
   --open        No traffic restrictions. Process hardening only. No sudo needed.
   --without-tools  Exclude network diagnostic tools (curl, dig, ping, nc, traceroute, wget).
                    Triggers a rebuild. Default is to include them (~10 MB, negligible vs image size).
-  --no-build       Skip the docker compose build step. Use when the image is already built
-                   and you just want to (re)start the container.
+  --build          Force a docker compose build before starting. Required after changing the
+                   Dockerfile or entrypoint. Skipped by default when the image already exists
+                   (BuildKit export/import adds several minutes even when all layers are cached).
+                   Before building, offers to save the current :latest as :working for rollback.
+  --working        Start from the :working image instead of :latest. Use to roll back after a
+                   broken build without needing to retag manually.
   -h            Show this help.
 EOF
 }
@@ -24,13 +28,15 @@ EOF
 _saved_level=$(grep '^SECURITY_LEVEL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)
 SECURITY_LEVEL="${_saved_level:-strict}"
 INCLUDE_TOOLS="true"
-NO_BUILD="false"
+FORCE_BUILD="false"
+USE_WORKING="false"
 for arg in "$@"; do
     case "$arg" in
         --strict)        SECURITY_LEVEL="strict" ;;
         --open)          SECURITY_LEVEL="open" ;;
-        --without-tools) INCLUDE_TOOLS="false" ;;
-        --no-build)      NO_BUILD="true" ;;
+        --without-tools) INCLUDE_TOOLS="false"; FORCE_BUILD="true" ;;
+        --build)         FORCE_BUILD="true" ;;
+        --working)       USE_WORKING="true" ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown option: $arg"; usage; exit 1 ;;
     esac
@@ -115,14 +121,36 @@ fi
 # Resource limits ship with soft defaults (.env / compose), so strict mode starts
 # out of the box. Run --open then ./stop-container to profile and tighten them.
 
-# --- Build ---
-if [ "$NO_BUILD" = "false" ]; then
+# --- Build / image selection ---
+IMAGE="${CONTAINER}:latest"
+if [ "$USE_WORKING" = "true" ]; then
+    IMAGE="${CONTAINER}:working"
+    if ! docker image inspect "$IMAGE" &>/dev/null; then
+        echo "Error: no :working image found. Run './start-container --build' first to create one."
+        exit 1
+    fi
+    echo "Using :working image (rollback mode)."
+elif [ "$FORCE_BUILD" = "true" ] || ! docker image inspect "$IMAGE" &>/dev/null; then
+    if docker image inspect "$IMAGE" &>/dev/null; then
+        _working="${CONTAINER}:working"
+        if docker image inspect "$_working" &>/dev/null; then
+            read -rp "Save current :latest as :working (overwrites existing :working)? [Y/n]: " _save
+        else
+            read -rp "Save current :latest as :working before rebuilding? [Y/n]: " _save
+        fi
+        if [ "${_save:-Y}" != "n" ] && [ "${_save:-Y}" != "N" ]; then
+            docker tag "$IMAGE" "$_working"
+            echo "Saved ${IMAGE} → ${_working}. To roll back: ./start-container --working"
+        fi
+    fi
     echo "Building $CONTAINER..."
-    if ! $COMPOSE_CMD build --quiet 2>&1; then
-        echo "Build failed. Run '$COMPOSE_CMD build' to see full output."
+    if ! $COMPOSE_CMD build; then
+        echo "Build failed. To roll back to the previous image: ./start-container --working"
         exit 1
     fi
     echo "Build succeeded."
+else
+    echo "Image $IMAGE exists — skipping build. Pass --build to force a rebuild."
 fi
 
 # --- Start ---

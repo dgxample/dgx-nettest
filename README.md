@@ -38,7 +38,7 @@ Most Linux systems already have everything else (`python3`, `openssl`, `setpriv`
 
 ```bash
 ./setup            # prompts for UID, port, lockdown, optional HTTPS; writes .env
-./start-container  # build, apply lockdown (strict by default), wait for health
+./start-container  # start (builds on first run), apply lockdown (strict by default), wait for health
 ```
 
 The URL (`http://` or `https://`) is printed once the container is healthy.
@@ -54,6 +54,8 @@ Re-run `./setup` at any time to change settings — all prompts default from the
 ```bash
 ./start-container            # strict (default) — blocks all outbound traffic
 ./start-container --open     # open — no outbound restrictions, no sudo needed
+./start-container --build    # force a rebuild (required after Dockerfile or entrypoint changes)
+./start-container --working  # roll back to the :working image saved before the last --build
 ./start-container --without-tools  # rebuild without curl/dig/ping/nc (tools are included by default)
 ```
 
@@ -61,8 +63,9 @@ Re-run `./setup` at any time to change settings — all prompts default from the
 |------|--------|
 | `--strict` | Blocks all container-initiated outbound traffic. Default. Requires sudo. |
 | `--open` | No traffic restrictions. Process hardening still applies. No sudo needed. |
+| `--build` | Force a docker compose build before starting. Skipped by default when the image already exists. Before building, offers to save the current `:latest` as `:working` for easy rollback. |
+| `--working` | Start from the `:working` image instead of `:latest`. Use to roll back after a broken build. |
 | `--without-tools` | Excludes curl, dig, ping, nc, traceroute, wget. Triggers a rebuild. Default is to include them. |
-| `--no-build` | Skip the docker compose build step. Use when image is already built. |
 
 The default security level is read from `.env`; the flags override it.
 
@@ -187,7 +190,7 @@ replace the request handler with your service and keep the surrounding scaffoldi
 | File | Purpose |
 |------|---------|
 | `setup` | Interactive installer: prompts for UID, port, lockdown mode, TLS, and restart policy; installs `docker-lockdown`; writes `.env`. Re-runnable — all prompts default from existing `.env`. |
-| `start-container` | Builds the image, starts the container, applies outbound lockdown (strict mode), and polls until the health check passes. Accepts `--open`, `--strict`, `--without-tools`, `--no-build`. |
+| `start-container` | Starts the container (builds on first run), applies outbound lockdown (strict mode), and polls until the health check passes. Accepts `--open`, `--strict`, `--without-tools`, `--build`, `--working`. |
 | `stop-container` | Stops the container and removes lockdown rules. In open mode, captures a resource snapshot and suggests `CPU_LIMIT`/`MEM_LIMIT` values for `.env`. |
 | `security-check` | Verifies posture of a running container: iptables rules present/absent, PID 1 non-root with no capabilities, inbound health check reachable, outbound traffic blocked (strict) or allowed (open). |
 | `security-compare` | Runs the container in open then strict mode back-to-back and prints a side-by-side PASS/FAIL/SKIP comparison table. Requires passwordless sudo for docker-lockdown. |
